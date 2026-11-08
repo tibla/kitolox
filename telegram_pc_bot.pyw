@@ -8,6 +8,7 @@ import time
 import shutil
 import uuid
 import ctypes
+import asyncio  # <--- Add this line here
 from ctypes import wintypes
 from pathlib import Path
 
