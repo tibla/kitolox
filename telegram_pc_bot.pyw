@@ -496,8 +496,15 @@ def main() -> None:
     application.add_error_handler(on_error)
     
     logger.info("Bot started; only the configured owner can use it.")
+    
+    # Explicitly ensure an event loop exists for the main thread (fixes pythonw / .pyw loop issues)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
+    
 if __name__ == "__main__":
     main()
